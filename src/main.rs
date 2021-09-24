@@ -1,6 +1,7 @@
 use std::{collections::HashMap, fs::{self, File}, io::{prelude::*, BufReader}, net::TcpStream, sync::mpsc::{self, Sender}, thread};
 use serde::{Serialize};
 use chrono::{Utc};
+use mysql::{Opts, Pool, prelude::Queryable};
 
 use crate::settings::Settings;
 
@@ -73,9 +74,15 @@ struct AMIResponse {
 }
 
 
-fn listener(server: settings::Server, sender: Sender<(String, String)>) {
+fn listener(server: settings::Server, sender: Sender<(String, AMIResponse)>) {
         // Lets start a TCP connection to the AMI server.
-        let mut stream = TcpStream::connect(format!("{}:{}", server.host, server.port)).unwrap();
+        let mut stream = match TcpStream::connect(format!("{}:{}", server.host, server.port)) {
+            Ok(stream) => stream,
+            Err(e) => {
+                println!("Unable to connect to TCP of server {}, {}:{}, with error: {}.", server.name, server.host, server.port, e);
+                return;
+            }
+        };
 
         let first_response = read_ami(&mut stream, true);
 
@@ -91,25 +98,30 @@ fn listener(server: settings::Server, sender: Sender<(String, String)>) {
 
         // Lets get the login response.
         let login_response = read_ami(&mut stream, false);
-        // The "Response" header must be "Success".
-        // @TODO Again, implement better error handling.
-        assert_eq!(login_response.headers.get("Response").unwrap(), "Success");
+
+        match login_response.headers.get("Response") {
+            Some(response) => {
+                if response != "Success" {
+                    println!("Login failed for server {}, with response: {}.", server.name, response);
+                    return;
+                }
+            },
+            None => {
+                println!("Unable to get login response while connecting to server {}.", server.name);
+                return;
+            }
+        }
 
         loop {
             let ami_response = read_ami(&mut stream, false);
-            let time = Utc::now();
             if ami_response.headers.len() > 0 {
                 // Lets check if the response contains the "Event" header.
                 // If it does we will print TIMESTAMP::JSON_RESPONSE.
                 if ami_response.headers.contains_key("Event") {
                     sender.send(
                         (server.name.clone(),
-                        format!(
-                            "{}::{}::{}\r\n", 
-                            server.name, 
-                            time.timestamp_millis(), 
-                            serde_json::to_string(&ami_response).unwrap()
-                        ))
+                        ami_response
+                    )
                     ).unwrap();
                 }
             }
@@ -134,6 +146,7 @@ fn open_file(path: String) -> File {
     .unwrap()
 }
 
+
 fn main() {
     // Lets get the settings from the settings module.
     let mut settings = match Settings::init() {
@@ -156,7 +169,7 @@ fn main() {
 
     let mut handles = vec![];
     
-    let (sender, receiver) = mpsc::channel::<(String, String)>();
+    let (sender, receiver) = mpsc::channel::<(String, AMIResponse)>();
 
     // Lets loop the server list and connect to each one on different threads.
     for server in &settings.servers {
@@ -180,6 +193,41 @@ fn main() {
         fs::create_dir_all(target_directory).unwrap();
     }
 
+    // This hashmap will hold all mysql pools.
+    let mut mysql_pool = HashMap::new();
+    // Lets loop settings.databases and create a connection for each one.
+    for database in &settings.databases {
+        println!("Connecting to MySQL database {}.", database.host);
+
+        // Lets first check if this database is already in the hashmap, if it is, it means there are duplicates in the settings, so we will error out.
+        if mysql_pool.contains_key(&database.host) {
+            println!("Database {} is already connected.", database.host);
+            return;
+        }
+
+        let url = format!("mysql://{}:{}@{}:{}/{}", database.user, database.password, database.host, database.port, database.database);
+        let opts = match Opts::from_url(&url) {
+            Ok(opts) => opts,
+            Err(e) => {
+                println!("Unable to connect to MySQL database {} with error: {}", database.host, e);
+                continue;
+            }
+        };
+
+        let pool = match Pool::new(opts) {
+            Ok(pool) => pool,
+            Err(e) => {
+                println!("Unable to connect to MySQL database {} with error: {}", database.host, e);
+                continue;
+            }
+        };
+
+
+        mysql_pool.insert(database.id.clone(), pool);
+
+        println!("Connected successfully to database {}.", database.host);
+    }
+
 
     let mut server_paths: HashMap<String, String> = HashMap::new();
 
@@ -200,13 +248,71 @@ fn main() {
     let all = String::from("all");
 
     loop {
-        let (server_name, msg) = match receiver.recv() {
-            Ok((server_name, msg)) => (server_name, msg),
+        let (server_name, ami_response) = match receiver.recv() {
+            Ok((server_name, ami_response)) => (server_name, ami_response),
             Err(e) => {
                 println!("Error: {}", e);
                 break;
             }
         };
+
+        // Now lets check if the event name matches any in the settings.event_clauses[event_name]
+        // If it does we will write the event to the database.
+        for event_clause in &settings.event_clauses {
+            if &event_clause.event_name == ami_response.headers.get("Event").unwrap() {
+                // So now we have a match, so we get the db pool from the db_connection_id, and target table from db_table.
+                let pool = mysql_pool.get(&event_clause.db_connection_id).unwrap();
+                let table = event_clause.db_table.clone();
+
+                // Now inside the event_clause we have a HashMap named event_data_link that will match the headers of the event to the database columns.
+                // So now we need to prepare the SQL statement, and the vector that will hold the values.
+                let mut columns = vec![];
+                let mut values = vec![];
+
+                for (event_key, mysql_column) in &event_clause.event_data_link {
+                    // Lets check if the event_key is in the ami_response.headers.
+                    if ami_response.headers.contains_key(event_key) {
+                        // If it is we will add the value to the values hashmap.
+                        values.push(mysql::Value::from(ami_response.headers.get(event_key)));
+                    } else {
+                        match event_key.as_str() {
+                            "%SERVER_NAME%" => {
+                                // If the event_key is %SERVER_NAME% we will add the server_name to the values hashmap.
+                                values.push(mysql::Value::from(&server_name));
+                            },
+                            _ => {
+                                values.push(mysql::Value::from(None::<String>));
+                            }
+                        }
+                    }
+                    // And add the column name to the columns.
+                    columns.push(mysql_column.clone());
+                }
+
+                // Now we have the columns and values, lets prepare the SQL statement.
+                let sql = format!(
+                    "INSERT INTO {} ({}) VALUES ({})", 
+                    table, 
+                    // We want all columns separated by commas.
+                    &columns.join(","), 
+                    // Now we want ? for each column or value.
+                    vec!["?"; columns.len()].join(",")
+                );
+
+
+                let mut conn = pool.get_conn().unwrap();
+                let _s: Vec<mysql::Row> = match conn.exec(sql, values) {
+                    Ok(s) =>  {
+                        println!("Successfully inserted row into database {} table {}.", &event_clause.db_connection_id, &event_clause.db_table);
+                        s
+                    },
+                    Err(e) => {
+                        println!("Unable to insert row into database {} table {} with error: {}", &event_clause.db_connection_id, &event_clause.db_table, e);
+                        continue;
+                    }
+                };
+            }
+        }
 
         let mut file: &File;
 
@@ -235,6 +341,16 @@ fn main() {
         } else {
             file = files.get(&all).unwrap();
         }
+
+        let time = Utc::now();
+
+        let msg = 
+        format!(
+            "{}::{}::{}\r\n", 
+            server_name, 
+            time.timestamp_millis(), 
+            serde_json::to_string(&ami_response).unwrap()
+        );
 
         // Lets write the message to the events file.
         file.write_all(msg.as_bytes()).unwrap();

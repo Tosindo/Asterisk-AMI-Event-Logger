@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
-use std::{fmt::Display, path::Path, fmt, error::Error, fs::OpenOptions, io::{Read, Write}};
+use std::{collections::HashMap, error::Error, fmt::Display, fmt, fs::OpenOptions, io::{Read, Write}, path::Path};
 
 
 #[derive(Debug)]
 pub enum SettingsError {
     ParseError(String),
+    WriteParseError(String),
     WriteError,
     ReadError,
 }
@@ -16,6 +17,9 @@ impl Display for SettingsError {
         match self {
             SettingsError::ParseError(msg) => {
                 write!(f, "Unable to parse settings file: {}", msg)
+            },
+            SettingsError::WriteParseError(msg) => {
+                write!(f, "Unable to write toml to file due to internal parsing error: {}", msg)
             },
             SettingsError::WriteError => {
                 write!(f, "Unable to write to settings file.")
@@ -30,7 +34,9 @@ impl Display for SettingsError {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Settings {
     pub basic: Basic,
-    pub servers: Vec<Server>
+    pub servers: Vec<Server>,
+    pub databases: Vec<DatabaseConnection>,
+    pub event_clauses: Vec<EventClause>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -54,8 +60,8 @@ impl Settings {
             // Lets convert the settings to a toml string and write it to the file.
             let toml = match toml::to_string(&settings) {
                 Ok(str) => str,
-                Err(_e) => {
-                    return Err(SettingsError::WriteError);
+                Err(e) => {
+                    return Err(SettingsError::WriteParseError(e.to_string()));
                 }
             };
             
@@ -105,6 +111,35 @@ impl Settings {
     }
 }
 
+// If we want to store a event into a database we are going to need 2 things:
+// A database connection.
+// A clause indicating what events we want to store, and how.
+// Lets create a clause struct:
+// This will be used to store the event into the database.
+// It will contain:
+// - Event name
+// - HashMap containing a link between event data and the database columns.
+// - Database connection id, and the table name.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct EventClause {
+    pub event_name: String,
+    pub db_connection_id: String,
+    pub db_table: String,
+    pub event_data_link: HashMap<String, String>,
+}
+
+// Now we want the ability to store multiple database connections, we will give them a unique string id to identify them.
+// Lets create a struct to hold the database connection information.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct DatabaseConnection {
+    pub id: String,
+    pub host: String,
+    pub port: i32,
+    pub user: String,
+    pub password: String,
+    pub database: String
+}
+
 // Represents a AMI Asterisk Server instance to be monitored.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Server {
@@ -135,6 +170,14 @@ impl Default for Settings {
             servers: vec![
                 Server::default(),
             ],
+            databases: vec![
+                DatabaseConnection::default(),
+                DatabaseConnection::default(),
+            ],
+            event_clauses: vec![
+                EventClause::default(),
+                EventClause::default(),
+            ],
         }
     }
 }
@@ -144,6 +187,33 @@ impl Default for Basic {
         Basic {
             target_directory: String::from("events"),
             directory_per_server: false
+        }
+    }
+}
+
+impl Default for EventClause {
+    fn default() -> Self {
+        EventClause {
+            event_name: String::from("example"),
+            event_data_link: [
+                (String::from("example_event_property"), String::from("example_db_column")),
+                (String::from("example_event_property_2"), String::from("example_db_column_2")),
+            ].iter().cloned().collect(),
+            db_connection_id: String::from("example"),
+            db_table: String::from("example")
+        }
+    }
+}
+
+impl Default for DatabaseConnection {
+    fn default() -> Self {
+        DatabaseConnection {
+            id: String::from("example"),
+            host: String::from("example.com"),
+            port: 3306,
+            user: String::from("example"),
+            password: String::from("example"),
+            database: String::from("example")
         }
     }
 }
