@@ -12,4 +12,5 @@ This project was used to be able to manage multiple Asterisk Servers Events, we 
 
 #### Todo:
 - Add better error descriptions.
+- Structure Code better.
 - **Urgent**: Check if the connection with the servers as dropped and reconnect. 
